@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>展開図の折り手順推定</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; }
+    body { max-width: 760px; margin: 36px auto; padding: 0 18px; color: #202124; line-height: 1.55; }
+    h1 { font-size: 1.45rem; margin-bottom: 8px; }
+    p { margin: 8px 0 18px; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    button, input::file-selector-button { font: inherit; padding: 8px 12px; }
+    button { cursor: pointer; }
+    button:disabled { cursor: default; opacity: .5; }
+    #status { min-height: 1.6em; margin: 16px 0; }
+    #status.error { color: #b00020; }
+    #results { padding: 0; list-style: none; }
+    #results li { display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 10px 0; border-top: 1px solid #ddd; }
+    #results a { white-space: nowrap; }
+    .note { color: #555; font-size: .92rem; }
+    #trace-panel { margin-top: 20px; }
+    #trace-output { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 55vh; overflow: auto; padding: 12px; background: #f5f5f5; border: 1px solid #ddd; }
+  </style>
+</head>
+<body>
+  <h1>展開図の折り手順推定</h1>
+  <p>ORIPA形式のCPファイルを読み込み、数値の小さい線から処理します。同じ数値でも、頂点を共有しない線分グループは別工程として累積CPを書き出します。</p>
+  <div class="row">
+    <input id="file" type="file" accept=".cp,text/plain">
+    <button id="run" type="button" disabled>解析して段階を作成</button>
+  </div>
+  <div id="status" role="status" aria-live="polite"></div>
+  <ul id="results"></ul>
+  <p class="note">線種1（枠線）は各工程に残します。伝播に矛盾が残る場合は、矛盾に関わるX系またはY系のグループを同じ工程にまとめます。</p>
+  <details id="trace-panel" open>
+    <summary>計算の途中経過</summary>
+    <pre id="trace-output">CPファイルを選択して解析すると、頂点判定と数値伝播の記録が表示されます。</pre>
+  </details>
+
+  <script>
+  "use strict";
+
+  const fileInput = document.getElementById("file");
+  const runButton = document.getElementById("run");
+  const statusBox = document.getElementById("status");
+  const resultsList = document.getElementById("results");
+  const traceOutput = document.getElementById("trace-output");
+  let selectedFile = null;
+  let currentUrls = [];
+
+  fileInput.addEventListener("change", () => {
+    selectedFile = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+    runButton.disabled = !selectedFile;
+    clearResults();
+    traceOutput.textContent = "";
+    setStatus(selectedFile ? `${selectedFile.name} を読み込みました。` : "");
+  });
+
+  runButton.addEventListener("click", async () => {
+    if (!selectedFile) return;
+    clearResults();
+    const trace = [];
+    traceOutput.textContent = "";
+    setStatus("解析中…");
+    try {
+      const source = await selectedFile.text();
+      const rawSegments = parseCp(source);
+      trace.push(`CP入力: ${rawSegments.length}本の線分`);
+      const graph = buildGraph(rawSegments);
+      trace.push(`グラフ化: 頂点${graph.points.length}個、枠線${graph.edges.filter(edge => edge.type === 1).length}本、山谷線${graph.creaseEdges.length}本`);
+      const levels = assignAndPropagate(graph, trace);
+      const exportInfo = renderStageDownloads(selectedFile.name, graph, levels, trace);
+      const relaxedCount = levels.relaxedVertices.length;
+      const relaxedLabel = relaxedCount ? `（X/Y系を同工程化${relaxedCount}群）` : "";
+      setStatus(`完了：${exportInfo.stepCount}工程、山谷線${graph.creaseEdges.length}本を処理しました${relaxedLabel}。`);
+      traceOutput.textContent = trace.join("\n");
+    } catch (error) {
+      trace.push(`\n停止: ${error instanceof Error ? error.message : String(error)}`);
+      traceOutput.textContent = trace.join("\n");
+      setStatus(error instanceof Error ? error.message : String(error), true);
+    }
+  });
+
+  function setStatus(message, isError = false) {
+    statusBox.textContent = message;
+    statusBox.classList.toggle("error", isError);
+  }
+
+  function clearResults() {
+    for (const url of currentUrls) URL.revokeObjectURL(url);
+    currentUrls = [];
+    resultsList.replaceChildren();
+  }
+
+  // ORIPA .cp: type(1=contour, 2=mountain, 3=valley), x1, y1, x2, y2.
+  function parseCp(text) {
+    const segments = [];
+    const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/);
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index].trim();
+      if (!line || line.startsWith("#")) continue;
+      const parts = line.split(/[\s,]+/);
+      if (parts.length !== 5) throw new Error(`${index + 1}行目: 線種と4個の座標を指定してください。`);
+      const type = Number(parts[0]);
+      const values = parts.slice(1).map(Number);
+      if (![1, 2, 3].includes(type) || values.some(value => !Number.isFinite(value))) {
+        throw new Error(`${index + 1}行目: 線種は1・2・3、座標は有限の数値で指定してください。`);
+      }
+      const [x1, y1, x2, y2] = values;
+      if (x1 === x2 && y1 === y2) throw new Error(`${index + 1}行目: 長さ0の線分があります。`);
+      segments.push({ type, x1, y1, x2, y2, cuts: [0, 1] });
+    }
+    if (!segments.length) throw new Error("CPファイルに線分がありません。");
+    return segments;
+  }
+
+  // Intersections are made explicit vertices, and collinear overlaps are split at endpoints.
+  function buildGraph(segments) {
+    const xs = segments.flatMap(s => [s.x1, s.x2]);
+    const ys = segments.flatMap(s => [s.y1, s.y2]);
+    const span = Math.max(1, Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+    const epsilon = span * 1e-9;
+    const parameterEpsilon = 1e-9;
+
+    for (let i = 0; i < segments.length; i++) {
+      for (let j = i + 1; j < segments.length; j++) {
+        splitAtIntersection(segments[i], segments[j], epsilon, parameterEpsilon);
+      }
+    }
+
+    const points = [];
+    const buckets = new Map();
+    function intern(x, y) {
+      const gx = Math.floor(x / epsilon);
+      const gy = Math.floor(y / epsilon);
+      let found = -1;
+      let bestDistance = Infinity;
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+        const ids = buckets.get(`${gx + dx},${gy + dy}`) || [];
+        for (const id of ids) {
+          const distance = Math.hypot(points[id].x - x, points[id].y - y);
+          if (distance <= epsilon && distance < bestDistance) { found = id; bestDistance = distance; }
+        }
+      }
+      if (found >= 0) return found;
+      const id = points.length;
+      points.push({ x, y });
+      const key = `${gx},${gy}`;
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(id);
+      return id;
+    }
+
+    const edgeByKey = new Map();
+    const edges = [];
+    for (const segment of segments) {
+      const cuts = uniqueSorted(segment.cuts, parameterEpsilon);
+      for (let k = 0; k + 1 < cuts.length; k++) {
+        const t0 = cuts[k], t1 = cuts[k + 1];
+        if (t1 - t0 <= parameterEpsilon) continue;
+        const a = intern(segment.x1 + (segment.x2 - segment.x1) * t0, segment.y1 + (segment.y2 - segment.y1) * t0);
+        const b = intern(segment.x1 + (segment.x2 - segment.x1) * t1, segment.y1 + (segment.y2 - segment.y1) * t1);
+        if (a === b) continue;
+        const key = a < b ? `${a}:${b}` : `${b}:${a}`;
+        const previous = edgeByKey.get(key);
+        if (previous) {
+          if (previous.type !== segment.type) throw new Error("同じ線分に異なる線種が重なっています。");
+          continue;
+        }
+        const edge = { id: edges.length, a, b, type: segment.type };
+        edges.push(edge);
+        edgeByKey.set(key, edge);
+      }
+    }
+
+    const creaseEdges = edges.filter(edge => edge.type === 2 || edge.type === 3);
+    const incident = new Map();
+    for (const edge of creaseEdges) {
+      for (const vertexId of [edge.a, edge.b]) {
+        if (!incident.has(vertexId)) incident.set(vertexId, []);
+        const otherId = vertexId === edge.a ? edge.b : edge.a;
+        const p = points[vertexId], q = points[otherId];
+        incident.get(vertexId).push({ edge, dx: q.x - p.x, dy: q.y - p.y });
+      }
+    }
+    return { points, edges, creaseEdges, incident };
+  }
+
+  function splitAtIntersection(a, b, epsilon, parameterEpsilon) {
+    const px = a.x1, py = a.y1, rx = a.x2 - a.x1, ry = a.y2 - a.y1;
+    const qx = b.x1, qy = b.y1, sx = b.x2 - b.x1, sy = b.y2 - b.y1;
+    const rLength = Math.hypot(rx, ry), sLength = Math.hypot(sx, sy);
+    const denominator = cross(rx, ry, sx, sy);
+    const qpx = qx - px, qpy = qy - py;
+    if (Math.abs(denominator) > epsilon * Math.max(rLength, sLength)) {
+      const t = cross(qpx, qpy, sx, sy) / denominator;
+      const u = cross(qpx, qpy, rx, ry) / denominator;
+      if (t >= -parameterEpsilon && t <= 1 + parameterEpsilon && u >= -parameterEpsilon && u <= 1 + parameterEpsilon) {
+        a.cuts.push(clamp01(t));
+        b.cuts.push(clamp01(u));
+      }
+      return;
+    }
+    if (Math.abs(cross(qpx, qpy, rx, ry)) > epsilon * rLength) return;
+    addProjectedCut(a, qx, qy, epsilon, parameterEpsilon);
+    addProjectedCut(a, b.x2, b.y2, epsilon, parameterEpsilon);
+    addProjectedCut(b, px, py, epsilon, parameterEpsilon);
+    addProjectedCut(b, a.x2, a.y2, epsilon, parameterEpsilon);
+  }
+
+  function addProjectedCut(segment, x, y, epsilon, parameterEpsilon) {
+    const dx = segment.x2 - segment.x1, dy = segment.y2 - segment.y1;
+    const lengthSquared = dx * dx + dy * dy;
+    const t = ((x - segment.x1) * dx + (y - segment.y1) * dy) / lengthSquared;
+    const projectedX = segment.x1 + t * dx, projectedY = segment.y1 + t * dy;
+    if (Math.hypot(projectedX - x, projectedY - y) <= epsilon && t >= -parameterEpsilon && t <= 1 + parameterEpsilon) {
+      segment.cuts.push(clamp01(t));
+    }
+  }
+
+  function uniqueSorted(values, epsilon) {
+    const sorted = [...values].sort((a, b) => a - b);
+    return sorted.filter((value, index) => index === 0 || value - sorted[index - 1] > epsilon);
+  }
+  function clamp01(value) { return Math.max(0, Math.min(1, value)); }
+  function cross(ax, ay, bx, by) { return ax * by - ay * bx; }
+
+  // X+1 and Y+1 use a fixed one-level offset; conflicting groups may be merged.
+  function assignAndPropagate(graph, trace) {
+    const originalTypes = new Map(graph.creaseEdges.map(edge => [edge.id, edge.type]));
+    const typeProposals = new Map();
+    const vertexRules = new Map();
+    const directionEpsilon = 1e-8;
+    const lineName = edgeId => `L${edgeId + 1}`;
+    const mvName = type => type === 2 ? "山" : "谷";
+
+    trace.push("", "【頂点ごとの判定】");
+
+    function proposeType(edge, type, vertexId, restoreSpokeIds) {
+      const previous = typeProposals.get(edge.id);
+      if (previous && previous.type !== type) {
+        throw new Error(`線分${edge.id + 1}: 頂点${previous.vertexId + 1}と頂点${vertexId + 1}で山谷の指定が食い違います。`);
+      }
+      const proposal = previous || { type, vertexId, restoreSources: [] };
+      if (restoreSpokeIds.length) proposal.restoreSources.push({ vertexId, spokeIds: restoreSpokeIds });
+      typeProposals.set(edge.id, proposal);
+    }
+
+    for (const [vertexId, spokes] of graph.incident) {
+      if (spokes.length > 4) throw new Error(`頂点${vertexId + 1}: 山谷線が5本以上あります（四価以下のみ対応）。`);
+      const oppositePairs = [];
+      for (let i = 0; i < spokes.length; i++) for (let j = i + 1; j < spokes.length; j++) {
+        const a = spokes[i], b = spokes[j];
+        const lengths = Math.hypot(a.dx, a.dy) * Math.hypot(b.dx, b.dy);
+        const normalizedCross = cross(a.dx, a.dy, b.dx, b.dy) / lengths;
+        if (Math.abs(normalizedCross) <= directionEpsilon && a.dx * b.dx + a.dy * b.dy < 0) oppositePairs.push([i, j]);
+      }
+
+      const rule = { spokeIds: spokes.map(spoke => spoke.edge.id), highEdgeIds: [], highKind: null };
+      let axisPair = null;
+      if (oppositePairs.length === 1) axisPair = oppositePairs[0];
+      else if (oppositePairs.length > 1) {
+        const unchangedPairs = oppositePairs.filter(([i, j]) => originalTypes.get(spokes[i].edge.id) === originalTypes.get(spokes[j].edge.id));
+        if (unchangedPairs.length !== 1) {
+          trace.push(`頂点V${vertexId + 1}: 180度の組が${oppositePairs.length}組あり、山谷が切り替わらない軸を一つに選べません。`);
+          throw new Error(`頂点${vertexId + 1}: 180度の組が複数ありますが、山谷が切り替わらない軸を一つに決められません。`);
+        }
+        axisPair = unchangedPairs[0];
+        trace.push(`頂点V${vertexId + 1}: 180度の組が複数あるため、山谷が切り替わらない組を軸に選択。`);
+      }
+
+      if (axisPair) {
+        const [i, j] = axisPair;
+        const edgeI = spokes[i].edge, edgeJ = spokes[j].edge;
+        const switchesMountainValley = originalTypes.get(edgeI.id) !== originalTypes.get(edgeJ.id);
+        const nonAxisSpokes = spokes.filter((_, index) => index !== i && index !== j);
+        if (!switchesMountainValley) {
+          rule.highKind = "x";
+          rule.highEdgeIds = nonAxisSpokes.map(spoke => spoke.edge.id);
+          trace.push(`頂点V${vertexId + 1}（価数${spokes.length}）: 軸${lineName(edgeI.id)}-${lineName(edgeJ.id)}は山谷同じ（${mvName(originalTypes.get(edgeI.id))}）。軸にX=1、残りにX+1=2。`);
+        } else {
+          const farVertexI = edgeI.a === vertexId ? edgeI.b : edgeI.a;
+          const farVertexJ = edgeJ.a === vertexId ? edgeJ.b : edgeJ.a;
+          const farIsFourValentI = (graph.incident.get(farVertexI) || []).length === 4;
+          const farIsFourValentJ = (graph.incident.get(farVertexJ) || []).length === 4;
+          if (!(farIsFourValentI && farIsFourValentJ)) {
+            rule.highKind = "y";
+            rule.highEdgeIds = nonAxisSpokes.map(spoke => spoke.edge.id);
+            const anchorIndex = farIsFourValentI !== farIsFourValentJ
+              ? (farIsFourValentI ? i : j)
+              : (Math.random() < 0.5 ? i : j);
+            const otherIndex = anchorIndex === i ? j : i;
+            const anchorType = originalTypes.get(spokes[anchorIndex].edge.id);
+            const oppositeType = originalTypes.get(spokes[otherIndex].edge.id);
+            const anchorReason = farIsFourValentI !== farIsFourValentJ
+              ? "反対側が四価の線分を基準"
+              : "両側とも四価でないためランダム選択";
+            trace.push(`頂点V${vertexId + 1}（価数${spokes.length}）: 軸${lineName(edgeI.id)}-${lineName(edgeJ.id)}は山谷切替。${anchorReason}し、${lineName(spokes[anchorIndex].edge.id)}の${mvName(anchorType)}に合わせる（${lineName(spokes[otherIndex].edge.id)}を${mvName(oppositeType)}から${mvName(anchorType)}へ反転）。軸にY=1、残りにY+1=2。`);
+            proposeType(spokes[otherIndex].edge, anchorType, vertexId, rule.highEdgeIds);
+          } else {
+            trace.push(`頂点V${vertexId + 1}（価数${spokes.length}）: 軸${lineName(edgeI.id)}-${lineName(edgeJ.id)}は山谷切替、反対側の頂点は両方四価。全線分にY=1。`);
+          }
+        }
+      } else {
+        trace.push(`頂点V${vertexId + 1}（価数${spokes.length}）: 180度の組なし。全線分にZ=1。`);
+      }
+      vertexRules.set(vertexId, rule);
+    }
+
+    function solve(relaxedVertices, captureTrace = false) {
+      const vertexInfo = new Map();
+      let initialMax = 1;
+      const propagationSteps = [];
+      let omittedSteps = 0;
+      for (const [vertexId, rule] of vertexRules) {
+        const offsets = new Map(rule.spokeIds.map(edgeId => [edgeId, 0]));
+        const highOffset = relaxedVertices.has(vertexId) ? 0 : 1;
+        for (const edgeId of rule.highEdgeIds) offsets.set(edgeId, highOffset);
+        for (const offset of offsets.values()) initialMax = Math.max(initialMax, 1 + offset);
+        vertexInfo.set(vertexId, { base: 1, offsets, predecessor: null, predecessorEdge: null });
+      }
+
+      const vertexCount = vertexInfo.size;
+      let settled = false;
+      let lastUpdated = null;
+      for (let pass = 0; pass < Math.max(1, vertexCount); pass++) {
+        let changed = false;
+        for (const edge of graph.creaseEdges) {
+          const left = vertexInfo.get(edge.a), right = vertexInfo.get(edge.b);
+          const leftValue = left.base + left.offsets.get(edge.id);
+          const rightValue = right.base + right.offsets.get(edge.id);
+          if (leftValue < rightValue) {
+            const increase = rightValue - leftValue;
+            left.base += increase;
+            left.predecessor = edge.b;
+            left.predecessorEdge = edge.id;
+            lastUpdated = edge.a;
+            if (captureTrace) {
+              if (propagationSteps.length < 300) propagationSteps.push(`反復${pass + 1}: ${lineName(edge.id)}でV${edge.a + 1}（価数${(graph.incident.get(edge.a) || []).length}）を${leftValue}→${rightValue}に上げる（頂点内を+${increase}）。`);
+              else omittedSteps++;
+            }
+            changed = true;
+          } else if (rightValue < leftValue) {
+            const increase = leftValue - rightValue;
+            right.base += increase;
+            right.predecessor = edge.a;
+            right.predecessorEdge = edge.id;
+            lastUpdated = edge.b;
+            if (captureTrace) {
+              if (propagationSteps.length < 300) propagationSteps.push(`反復${pass + 1}: ${lineName(edge.id)}でV${edge.b + 1}（価数${(graph.incident.get(edge.b) || []).length}）を${rightValue}→${leftValue}に上げる（頂点内を+${increase}）。`);
+              else omittedSteps++;
+            }
+            changed = true;
+          }
+        }
+        if (!changed) { settled = true; break; }
+      }
+      if (captureTrace) {
+        trace.push(`この試行で頂点値を上げた回数: ${propagationSteps.length + omittedSteps}回。`);
+        trace.push(...propagationSteps);
+        if (omittedSteps) trace.push(`表示上限により、残り${omittedSteps}回の更新は省略。`);
+      }
+
+      if (!settled) {
+        let cursor = lastUpdated;
+        for (let i = 0; cursor !== null && i < vertexCount; i++) {
+          cursor = vertexInfo.get(cursor)?.predecessor ?? null;
+        }
+        const cycleVertices = [], cycleEdges = [], seen = new Map();
+        while (cursor !== null && !seen.has(cursor) && cycleVertices.length <= vertexCount) {
+          seen.set(cursor, cycleVertices.length);
+          const info = vertexInfo.get(cursor);
+          if (!info || info.predecessor === null) break;
+          cycleVertices.push(cursor);
+          cycleEdges.push(info.predecessorEdge);
+          cursor = info.predecessor;
+        }
+        if (cursor !== null && seen.has(cursor)) {
+          const start = seen.get(cursor);
+          cycleVertices.splice(0, start);
+          cycleEdges.splice(0, start);
+        } else {
+          cycleVertices.length = 0;
+          cycleEdges.length = 0;
+        }
+        const maxAssigned = Math.max(1, ...[...vertexInfo.values()].flatMap(info =>
+          [...info.offsets.values()].map(offset => info.base + offset)));
+        return { ok: false, initialMax, maxAssigned, cycleVertices, cycleEdges };
+      }
+
+      const edgeLevels = new Map();
+      for (const edge of graph.creaseEdges) {
+        const a = vertexInfo.get(edge.a), b = vertexInfo.get(edge.b);
+        const levelA = a.base + a.offsets.get(edge.id);
+        const levelB = b.base + b.offsets.get(edge.id);
+        if (levelA !== levelB) throw new Error("線分の両端の数値が一致しません。");
+        edgeLevels.set(edge.id, levelA);
+      }
+
+      const restoreAt = new Map();
+      const restoreOnEdges = new Map();
+      for (const [edgeId, proposal] of typeProposals) {
+        const restoreLevels = new Set();
+        const triggerEdgeIds = new Set();
+        for (const source of proposal.restoreSources) {
+          const sourceLevels = [...new Set(source.spokeIds.map(spokeId => edgeLevels.get(spokeId)))];
+          if (sourceLevels.length > 1) {
+            throw new Error(`頂点${source.vertexId + 1}: Y+1に割り当てた線分の工程数が一致しません。`);
+          }
+          if (sourceLevels.length === 1) {
+            restoreLevels.add(sourceLevels[0]);
+            for (const spokeId of source.spokeIds) triggerEdgeIds.add(spokeId);
+          }
+        }
+        if (restoreLevels.size > 1) {
+          throw new Error(`線分${edgeId + 1}: 山谷を元に戻す工程が頂点間で一致しません。`);
+        }
+        if (restoreLevels.size === 1) {
+          restoreAt.set(edgeId, [...restoreLevels][0]);
+          restoreOnEdges.set(edgeId, triggerEdgeIds);
+        }
+      }
+      const stageLevels = [...new Set(edgeLevels.values())].sort((a, b) => a - b);
+      if (!stageLevels.length) stageLevels.push(1);
+      return { ok: true, edgeLevels, stageLevels, originalTypes, restoreAt, restoreOnEdges };
+    }
+
+    trace.push("", "【頂点間の数値伝播】", "X+1/Y+1は各頂点で1段差として開始。");
+    let relaxedVertices = new Set();
+    let result = solve(relaxedVertices, true);
+
+    while (!result.ok) {
+      const cycleEdges = new Set(result.cycleEdges);
+      const cycleText = result.cycleVertices.length
+        ? result.cycleVertices.map(vertexId => `V${vertexId + 1}`).join(" → ")
+        : "特定できず";
+      trace.push(`未収束: 仮の最大数値=${result.maxAssigned}、矛盾循環=${cycleText}。`);
+      const onCycle = vertexId => {
+        const rule = vertexRules.get(vertexId);
+        return (rule?.highKind === "x" || rule?.highKind === "y") &&
+          rule.highEdgeIds.some(edgeId => cycleEdges.has(edgeId));
+      };
+      let candidates = result.cycleVertices.filter(vertexId => onCycle(vertexId) && !relaxedVertices.has(vertexId));
+      if (!candidates.length && !result.cycleVertices.length) {
+        candidates = [...vertexRules].filter(([vertexId, rule]) =>
+          (rule.highKind === "x" || rule.highKind === "y") && !relaxedVertices.has(vertexId)).map(([vertexId]) => vertexId);
+      }
+      if (!candidates.length) {
+        throw new Error("+1の規則を維持したままでは伝播が収束せず、同工程化できるX/Y系グループがありません。");
+      }
+
+      let best = null;
+      for (const vertexId of candidates.sort((a, b) => a - b)) {
+        const trialRelaxed = new Set(relaxedVertices);
+        trialRelaxed.add(vertexId);
+        const trial = solve(trialRelaxed);
+        const score = trial.ok ? [-1, 0] : [trial.cycleEdges.length || Number.MAX_SAFE_INTEGER, trial.maxAssigned];
+        if (!best || score[0] < best.score[0] || (score[0] === best.score[0] && score[1] < best.score[1])) {
+          best = { vertexId, trialRelaxed, score };
+        }
+      }
+      relaxedVertices = best.trialRelaxed;
+      const rule = vertexRules.get(best.vertexId);
+      trace.push(`頂点V${best.vertexId + 1}の${rule.highKind.toUpperCase()}群（${rule.highEdgeIds.map(lineName).join("・")}）を同工程化。`);
+      result = solve(relaxedVertices, true);
+      trace.push(result.ok ? "この変更で収束。" : "まだ矛盾が残るため、次の候補を試します。");
+    }
+
+    const relaxedSummary = [...relaxedVertices].map(vertexId => {
+      const rule = vertexRules.get(vertexId);
+      return `V${vertexId + 1}${rule.highKind.toUpperCase()}`;
+    }).join(", ");
+    trace.push("", `【最終値】同工程化グループ: ${relaxedSummary || "なし"}。存在する数値段階: ${result.stageLevels.join(", ")}`);
+    for (const [edgeId, proposal] of typeProposals) {
+      const edge = graph.creaseEdges.find(item => item.id === edgeId);
+      edge.type = proposal.type;
+      const restoreLevel = result.restoreAt.get(edgeId);
+      trace.push(`${lineName(edgeId)}: 山谷を${mvName(originalTypes.get(edgeId))}から${mvName(proposal.type)}に一時変更${restoreLevel === undefined ? "（復元工程なし）" : `し、数値${restoreLevel}の工程で元に戻す`}。`);
+    }
+    for (const edge of graph.creaseEdges) {
+      trace.push(`${lineName(edge.id)}: 数値${result.edgeLevels.get(edge.id)}、山谷${mvName(edge.type)}。`);
+    }
+    return { ...result, relaxedVertices: [...relaxedVertices] };
+  }
+
+  function edgeComponents(edges) {
+    const byVertex = new Map();
+    for (const edge of edges) for (const vertexId of [edge.a, edge.b]) {
+      if (!byVertex.has(vertexId)) byVertex.set(vertexId, []);
+      byVertex.get(vertexId).push(edge);
+    }
+
+    const visited = new Set();
+    const components = [];
+    for (const firstEdge of [...edges].sort((a, b) => a.id - b.id)) {
+      if (visited.has(firstEdge.id)) continue;
+      const component = [];
+      const stack = [firstEdge];
+      visited.add(firstEdge.id);
+      while (stack.length) {
+        const edge = stack.pop();
+        component.push(edge);
+        for (const vertexId of [edge.a, edge.b]) {
+          for (const neighbor of byVertex.get(vertexId) || []) {
+            if (!visited.has(neighbor.id)) {
+              visited.add(neighbor.id);
+              stack.push(neighbor);
+            }
+          }
+        }
+      }
+      component.sort((a, b) => a.id - b.id);
+      components.push(component);
+    }
+    return components;
+  }
+
+  function renderStageDownloads(sourceName, graph, levels, trace) {
+    const baseName = sourceName.replace(/\.cp$/i, "") || "crease_pattern";
+    const includedCreaseIds = new Set();
+    let stage = 0;
+    trace.push("", "【同じ数値内のグループ分けと工程】");
+
+    for (const threshold of levels.stageLevels) {
+      let components = edgeComponents(graph.creaseEdges.filter(edge => levels.edgeLevels.get(edge.id) === threshold));
+      if (!graph.creaseEdges.length && threshold === levels.stageLevels[0]) components = [[]];
+      trace.push(`数値${threshold}: 頂点を共有する線分をまとめて${components.length}グループに分割。`);
+
+      for (let groupIndex = 0; groupIndex < components.length; groupIndex++) {
+        const component = components[groupIndex];
+        stage++;
+        for (const edge of component) includedCreaseIds.add(edge.id);
+        const selected = graph.edges.filter(edge => edge.type === 1 || includedCreaseIds.has(edge.id));
+        const contents = selected.map(edge => {
+          const a = graph.points[edge.a], b = graph.points[edge.b];
+          const restoreTriggers = levels.restoreOnEdges.get(edge.id);
+          const shouldRestore = restoreTriggers && [...restoreTriggers].every(edgeId => includedCreaseIds.has(edgeId));
+          const type = shouldRestore ? levels.originalTypes.get(edge.id) : edge.type;
+          return `${type} ${formatNumber(a.x)} ${formatNumber(a.y)} ${formatNumber(b.x)} ${formatNumber(b.y)}`;
+        }).join("\r\n") + "\r\n";
+        const filename = `${baseName}_step_${stage}.cp`;
+        const url = URL.createObjectURL(new Blob([contents], { type: "text/plain;charset=us-ascii" }));
+        currentUrls.push(url);
+        const item = document.createElement("li");
+        const label = document.createElement("span");
+        label.textContent = `工程${stage}（数値${threshold}、グループ${groupIndex + 1}/${components.length}、追加${component.length}本・累計${includedCreaseIds.size}本）`;
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        link.textContent = `${filename} を保存`;
+        item.append(label, link);
+        resultsList.append(item);
+        trace.push(`工程${stage}: 数値${threshold}のグループ${groupIndex + 1} [${component.map(edge => `L${edge.id + 1}`).join(", ") || "線なし"}] を追加。累計${includedCreaseIds.size}本。`);
+      }
+    }
+    return { stepCount: stage };
+  }
+
+  function formatNumber(value) {
+    if (Object.is(value, -0)) return "0";
+    return Number(value.toPrecision(12)).toString();
+  }
+  </script>
+</body>
+</html>
